@@ -1,0 +1,6 @@
+{
+  "name": "Legal Success India – Trademark Advisory PDF Generator",
+  "description": "Production trademark examination and Section 11 advisory report generator with live A4 preview, Indian Rupee fee calculator, saved reports database, templates, and PDF-lib export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

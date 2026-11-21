@@ -1,0 +1,60 @@
+// Reference Prisma Schema (SQLite by default; switch provider to "postgresql" for PostgreSQL deployment)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String   @map("password_hash")
+  role         String   @default("ADMIN")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+model Report {
+  id                       String   @id @default(cuid())
+  documentId               String   @unique @map("document_id")
+  reportReferenceNumber    String   @map("report_reference_number")
+  applicantName            String   @default("") @map("applicant_name")
+  brandName                String   @map("brand_name")
+  applicationNumber        String   @map("application_number")
+  trademarkClass           String   @default("") @map("trademark_class")
+  earlierTrademark         String   @default("") @map("earlier_trademark")
+  earlierApplicationNumber String   @default("") @map("earlier_application_number")
+  documentDate             String   @map("document_date")
+  payloadJson              String   @map("payload_json")
+  reportStatus             String   @default("Draft") @map("report_status")
+  pdfPath                  String?  @map("pdf_path")
+  createdAt                DateTime @default(now()) @map("created_at")
+  updatedAt                DateTime @updatedAt @map("updated_at")
+
+  @@map("reports")
+}
+
+model Template {
+  id                     String   @id @default(cuid())
+  name                   String
+  description            String   @default("")
+  provision              String   @default("")
+  headingText            String   @map("heading_text")
+  salutation             String
+  openingParagraphsJson  String   @map("opening_paragraphs_json")
+  sectionsJson           String   @map("sections_json")
+  defaultProfessionalFee Float    @default(9500) @map("default_professional_fee")
+  defaultGovernmentFee   Float    @default(0) @map("default_government_fee")
+  isDefault              Boolean  @default(false) @map("is_default")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  @@map("templates")
+}
