@@ -1,9 +1,8 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiAuth } from '@/lib/auth';
 import { createReport, getOrganizationSettings, getReportById, updateReport } from '@/lib/db';
 import { generateAdvisoryPdf } from '@/lib/pdf-generator';
+import { savePdfToCache } from '@/lib/storage';
 import { buildPdfFilename } from '@/lib/text-utils';
 import { ReportPayloadSchema } from '@/lib/types';
 
@@ -25,10 +24,7 @@ export async function POST(req: NextRequest) {
     const orgSettings = getOrganizationSettings();
     const generated = await generateAdvisoryPdf(payload, orgSettings);
 
-    const dir = path.join(process.cwd(), 'storage', 'generated-pdfs');
-    fs.mkdirSync(dir, { recursive: true });
-    const relPath = path.join('storage', 'generated-pdfs', `${payload.documentId}.pdf`);
-    fs.writeFileSync(path.join(process.cwd(), relPath), generated.bytes);
+    const relPath = savePdfToCache(payload.documentId, generated.bytes);
 
     const nextStatus = payload.reportStatus === 'Finalized' ? 'Finalized' : 'Generated';
     const nextPayload = { ...payload, reportStatus: nextStatus as typeof payload.reportStatus };

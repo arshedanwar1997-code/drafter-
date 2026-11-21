@@ -1,6 +1,6 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import bcrypt from 'bcryptjs';
 import {
   AdminUser,
@@ -21,102 +21,294 @@ import {
   INITIAL_TEMPLATES,
 } from './default-data';
 import { todayIsoDate } from './text-utils';
+import { isServerlessReadOnlyEnv } from './storage';
 
-const DB_PATH = process.env.SQLITE_DB_PATH
-  ? path.resolve(process.cwd(), process.env.SQLITE_DB_PATH)
-  : path.join(process.cwd(), 'data', 'trademark_advisory.db');
-
-let dbInstance: DatabaseSync | null = null;
-
-function getDb(): DatabaseSync {
-  if (dbInstance) return dbInstance;
-
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  const db = new DatabaseSync(DB_PATH);
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA foreign_keys = ON;');
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      email TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'ADMIN',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS reports (
-      id TEXT PRIMARY KEY,
-      document_id TEXT UNIQUE NOT NULL,
-      report_reference_number TEXT NOT NULL,
-      applicant_name TEXT NOT NULL DEFAULT '',
-      brand_name TEXT NOT NULL,
-      application_number TEXT NOT NULL,
-      trademark_class TEXT NOT NULL DEFAULT '',
-      earlier_trademark TEXT NOT NULL DEFAULT '',
-      earlier_application_number TEXT NOT NULL DEFAULT '',
-      document_date TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      report_status TEXT NOT NULL DEFAULT 'Draft',
-      pdf_path TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS templates (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      description TEXT NOT NULL DEFAULT '',
-      provision TEXT NOT NULL DEFAULT '',
-      heading_text TEXT NOT NULL,
-      salutation TEXT NOT NULL,
-      opening_paragraphs_json TEXT NOT NULL,
-      sections_json TEXT NOT NULL,
-      default_professional_fee REAL NOT NULL DEFAULT 9500,
-      default_government_fee REAL NOT NULL DEFAULT 0,
-      is_default INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS legal_clauses (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      category TEXT NOT NULL,
-      provision TEXT NOT NULL,
-      content TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS fee_presets (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      description TEXT NOT NULL DEFAULT '',
-      professional_fee REAL NOT NULL DEFAULT 0,
-      government_fee REAL NOT NULL DEFAULT 0,
-      other_charges REAL NOT NULL DEFAULT 0,
-      gst REAL NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
-
-  seedInitialData(db);
-  dbInstance = db;
-  return db;
+interface SqliteStatement {
+  get: (...params: unknown[]) => unknown;
+  all: (...params: unknown[]) => unknown[];
+  run: (...params: unknown[]) => { changes: number };
 }
 
-function seedInitialData(db: DatabaseSync) {
+interface SqliteDatabase {
+  exec: (sql: string) => void;
+  prepare: (sql: string) => SqliteStatement;
+}
+
+interface SqliteBuiltinModule {
+  DatabaseSync: new (location: string) => SqliteDatabase;
+}
+
+interface MemoryStore {
+  users: (AdminUser & { passwordHash: string })[];
+  reports: SavedReport[];
+  templates: ReportTemplate[];
+  legalClauses: LegalClause[];
+  feePresets: FeePreset[];
+  organizationSettings: OrganizationSettings;
+}
+
+const globalForDb = globalThis as unknown as {
+  __tmAdvisorySqlite?: SqliteDatabase;
+  __tmAdvisoryMemStore?: MemoryStore;
+  __tmAdvisoryUseMemory?: boolean;
+};
+
+function getInitialSeedRecords() {
   const now = new Date().toISOString();
 
-  // 1. Seed initial admin only if users table is empty
+  const anzora = createDefaultReportPayload();
+  anzora.documentId = 'LSI-20261118-8127';
+  anzora.reportReferenceNumber = 'TM/ADV/2026/81270';
+  anzora.documentDate = todayIsoDate();
+  anzora.applicantName = 'Anzora Lifestyle Pvt. Ltd.';
+  anzora.reportStatus = 'Finalized';
+
+  const rhino = createDefaultReportPayload();
+  rhino.documentId = 'LSI-20261117-4491';
+  rhino.reportReferenceNumber = 'TM/ADV/2026/44912';
+  rhino.documentDate = todayIsoDate();
+  rhino.applicantName = 'Rhino Agro Implements';
+  rhino.brandName = 'RHINO TRACTOR ATTACHMENTS';
+  rhino.applicationNumber = '6412980';
+  rhino.trademarkClass = 'Class 7';
+  rhino.earlierTrademarks = [
+    {
+      id: 'em-r1',
+      markName: 'RHINO HEAVY ENGINEERING',
+      applicationNumber: '4120874',
+      registrationNumber: '4120874',
+      trademarkClass: 'Class 7',
+      proprietorName: 'Rhino Engineering Works',
+      status: 'Registered',
+      similarityType: 'Phonetic & Conceptual Similarity',
+      similarityDescription: 'Shared prefix RHINO in Class 7 agricultural machinery.',
+    },
+  ];
+  rhino.fees.professionalFee = 6500;
+  rhino.fees.governmentFee = 4500;
+  rhino.reportStatus = 'Generated';
+
+  const oshaita = createDefaultReportPayload();
+  oshaita.documentId = 'LSI-20261115-3109';
+  oshaita.reportReferenceNumber = 'TM/ADV/2026/31095';
+  oshaita.documentDate = '2026-11-15';
+  oshaita.applicantName = 'Oshaita Consumer Products';
+  oshaita.brandName = 'OSHAITA PREMIUM';
+  oshaita.applicationNumber = '7058321';
+  oshaita.trademarkClass = 'Class 30';
+  oshaita.applicationProvision = 'Section 9 – Absolute Grounds for Refusal';
+  oshaita.currentStatus = 'Objection Raised';
+  oshaita.subject = 'Section 9(1)(b) – Descriptive Laudatory Wordmark Advisory';
+  oshaita.earlierTrademarks = [
+    {
+      id: 'em-o1',
+      markName: 'OSHAITA FOODS',
+      applicationNumber: '3981205',
+      registrationNumber: '',
+      trademarkClass: 'Class 30',
+      proprietorName: 'Oshaita Enterprises',
+      status: 'Pending',
+      similarityType: 'Visual Similarity',
+      similarityDescription: 'Overlapping mark element in Class 30 food products.',
+    },
+  ];
+  oshaita.fees.professionalFee = 5500;
+  oshaita.reportStatus = 'Draft';
+
+  const samples: [string, ReportPayload][] = [
+    ['rep-anzora-1', anzora],
+    ['rep-rhino-2', rhino],
+    ['rep-oshaita-3', oshaita],
+  ];
+
+  return { now, samples };
+}
+
+function getMemoryStore(): MemoryStore {
+  if (globalForDb.__tmAdvisoryMemStore) {
+    return globalForDb.__tmAdvisoryMemStore;
+  }
+
+  const { now, samples } = getInitialSeedRecords();
+  const email = (process.env.INITIAL_ADMIN_EMAIL || 'admin@legalsuccessindia.in').toLowerCase();
+  const password = process.env.INITIAL_ADMIN_PASSWORD || 'LegalSuccess@2026';
+
+  let passwordHash = '';
+  try {
+    passwordHash = bcrypt.hashSync(password, 10);
+  } catch {
+    passwordHash = '';
+  }
+
+  const store: MemoryStore = {
+    users: [
+      {
+        id: 'admin-1',
+        email,
+        name: 'Legal Success India Admin',
+        role: 'ADMIN',
+        passwordHash,
+      },
+    ],
+    reports: samples.map(([id, payload]) => ({
+      ...payload,
+      id,
+      pdfPath: null,
+      createdAt: now,
+      updatedAt: now,
+    })),
+    templates: INITIAL_TEMPLATES.map((t) => ({
+      ...t,
+      createdAt: now,
+      updatedAt: now,
+    })),
+    legalClauses: INITIAL_LEGAL_CLAUSES.map((c) => ({
+      ...c,
+      updatedAt: now,
+    })),
+    feePresets: INITIAL_FEE_PRESETS.map((f) => ({
+      ...f,
+      updatedAt: now,
+    })),
+    organizationSettings: { ...DEFAULT_ORGANIZATION_SETTINGS },
+  };
+
+  globalForDb.__tmAdvisoryMemStore = store;
+  return store;
+}
+
+function loadSqliteBuiltin(): SqliteBuiltinModule | null {
+  try {
+    const proc = process as unknown as {
+      getBuiltinModule?: (id: string) => unknown;
+    };
+    if (typeof proc.getBuiltinModule === 'function') {
+      const mod = proc.getBuiltinModule('node:sqlite') as SqliteBuiltinModule | undefined;
+      if (mod && typeof mod.DatabaseSync === 'function') {
+        return mod;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function resolveCandidateDbPaths(): string[] {
+  if (process.env.SQLITE_DB_PATH) {
+    return [path.resolve(process.cwd(), process.env.SQLITE_DB_PATH)];
+  }
+  const tmpPath = path.join(os.tmpdir(), 'trademark_advisory.db');
+  if (isServerlessReadOnlyEnv()) {
+    return [tmpPath];
+  }
+  return [path.join(process.cwd(), 'data', 'trademark_advisory.db'), tmpPath];
+}
+
+function getDb(): SqliteDatabase | null {
+  if (globalForDb.__tmAdvisoryUseMemory) return null;
+  if (globalForDb.__tmAdvisorySqlite) return globalForDb.__tmAdvisorySqlite;
+
+  const sqlite = loadSqliteBuiltin();
+  if (!sqlite) {
+    globalForDb.__tmAdvisoryUseMemory = true;
+    return null;
+  }
+
+  for (const dbPath of resolveCandidateDbPaths()) {
+    try {
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+      const db = new sqlite.DatabaseSync(dbPath);
+      db.exec('PRAGMA journal_mode = WAL;');
+      db.exec('PRAGMA foreign_keys = ON;');
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          email TEXT UNIQUE NOT NULL,
+          name TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'ADMIN',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS reports (
+          id TEXT PRIMARY KEY,
+          document_id TEXT UNIQUE NOT NULL,
+          report_reference_number TEXT NOT NULL,
+          applicant_name TEXT NOT NULL DEFAULT '',
+          brand_name TEXT NOT NULL,
+          application_number TEXT NOT NULL,
+          trademark_class TEXT NOT NULL DEFAULT '',
+          earlier_trademark TEXT NOT NULL DEFAULT '',
+          earlier_application_number TEXT NOT NULL DEFAULT '',
+          document_date TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          report_status TEXT NOT NULL DEFAULT 'Draft',
+          pdf_path TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS templates (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          provision TEXT NOT NULL DEFAULT '',
+          heading_text TEXT NOT NULL,
+          salutation TEXT NOT NULL,
+          opening_paragraphs_json TEXT NOT NULL,
+          sections_json TEXT NOT NULL,
+          default_professional_fee REAL NOT NULL DEFAULT 9500,
+          default_government_fee REAL NOT NULL DEFAULT 0,
+          is_default INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS legal_clauses (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          category TEXT NOT NULL,
+          provision TEXT NOT NULL,
+          content TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS fee_presets (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          professional_fee REAL NOT NULL DEFAULT 0,
+          government_fee REAL NOT NULL DEFAULT 0,
+          other_charges REAL NOT NULL DEFAULT 0,
+          gst REAL NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+
+      seedInitialData(db);
+      globalForDb.__tmAdvisorySqlite = db;
+      return db;
+    } catch {
+      // Try next candidate path or fall back to in-memory store
+    }
+  }
+
+  globalForDb.__tmAdvisoryUseMemory = true;
+  return null;
+}
+
+function seedInitialData(db: SqliteDatabase) {
+  const { now, samples } = getInitialSeedRecords();
+
   const userCount = db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number };
   if (userCount.c === 0) {
     const email = process.env.INITIAL_ADMIN_EMAIL || 'admin@legalsuccessindia.in';
@@ -128,7 +320,6 @@ function seedInitialData(db: DatabaseSync) {
     ).run('admin-1', email.toLowerCase(), 'Legal Success India Admin', hash, 'ADMIN', now, now);
   }
 
-  // 2. Seed initial 5 templates
   const tplCount = db.prepare('SELECT COUNT(*) as c FROM templates').get() as { c: number };
   if (tplCount.c === 0) {
     const stmt = db.prepare(
@@ -154,7 +345,6 @@ function seedInitialData(db: DatabaseSync) {
     }
   }
 
-  // 3. Seed legal clauses
   const clauseCount = db.prepare('SELECT COUNT(*) as c FROM legal_clauses').get() as { c: number };
   if (clauseCount.c === 0) {
     const stmt = db.prepare(
@@ -165,7 +355,6 @@ function seedInitialData(db: DatabaseSync) {
     }
   }
 
-  // 4. Seed fee presets
   const feeCount = db.prepare('SELECT COUNT(*) as c FROM fee_presets').get() as { c: number };
   if (feeCount.c === 0) {
     const stmt = db.prepare(
@@ -176,7 +365,6 @@ function seedInitialData(db: DatabaseSync) {
     }
   }
 
-  // 5. Seed organization settings
   const orgRow = db.prepare('SELECT key FROM settings WHERE key = ?').get('organization');
   if (!orgRow) {
     db.prepare('INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)').run(
@@ -186,78 +374,12 @@ function seedInitialData(db: DatabaseSync) {
     );
   }
 
-  // 6. Seed 3 realistic sample reports (ANZORA, RHINO TRACTOR ATTACHMENTS, OSHAITA PREMIUM)
   const reportCount = db.prepare('SELECT COUNT(*) as c FROM reports').get() as { c: number };
   if (reportCount.c === 0) {
-    const anzora = createDefaultReportPayload();
-    anzora.documentId = 'LSI-20261118-8127';
-    anzora.reportReferenceNumber = 'TM/ADV/2026/81270';
-    anzora.documentDate = todayIsoDate();
-    anzora.applicantName = 'Anzora Lifestyle Pvt. Ltd.';
-    anzora.reportStatus = 'Finalized';
-
-    const rhino = createDefaultReportPayload();
-    rhino.documentId = 'LSI-20261117-4491';
-    rhino.reportReferenceNumber = 'TM/ADV/2026/44912';
-    rhino.documentDate = todayIsoDate();
-    rhino.applicantName = 'Rhino Agro Implements';
-    rhino.brandName = 'RHINO TRACTOR ATTACHMENTS';
-    rhino.applicationNumber = '6412980';
-    rhino.trademarkClass = 'Class 7';
-    rhino.earlierTrademarks = [
-      {
-        id: 'em-r1',
-        markName: 'RHINO HEAVY ENGINEERING',
-        applicationNumber: '4120874',
-        registrationNumber: '4120874',
-        trademarkClass: 'Class 7',
-        proprietorName: 'Rhino Engineering Works',
-        status: 'Registered',
-        similarityType: 'Phonetic & Conceptual Similarity',
-        similarityDescription: 'Shared prefix RHINO in Class 7 agricultural machinery.',
-      },
-    ];
-    rhino.fees.professionalFee = 6500;
-    rhino.fees.governmentFee = 4500;
-    rhino.reportStatus = 'Generated';
-
-    const oshaita = createDefaultReportPayload();
-    oshaita.documentId = 'LSI-20261115-3109';
-    oshaita.reportReferenceNumber = 'TM/ADV/2026/31095';
-    oshaita.documentDate = '2026-11-15';
-    oshaita.applicantName = 'Oshaita Consumer Products';
-    oshaita.brandName = 'OSHAITA PREMIUM';
-    oshaita.applicationNumber = '7058321';
-    oshaita.trademarkClass = 'Class 30';
-    oshaita.applicationProvision = 'Section 9 – Absolute Grounds for Refusal';
-    oshaita.currentStatus = 'Objection Raised';
-    oshaita.subject = 'Section 9(1)(b) – Descriptive Laudatory Wordmark Advisory';
-    oshaita.earlierTrademarks = [
-      {
-        id: 'em-o1',
-        markName: 'OSHAITA FOODS',
-        applicationNumber: '3981205',
-        registrationNumber: '',
-        trademarkClass: 'Class 30',
-        proprietorName: 'Oshaita Enterprises',
-        status: 'Pending',
-        similarityType: 'Visual Similarity',
-        similarityDescription: 'Overlapping mark element in Class 30 food products.',
-      },
-    ];
-    oshaita.fees.professionalFee = 5500;
-    oshaita.reportStatus = 'Draft';
-
     const insertStmt = db.prepare(
       `INSERT INTO reports (id, document_id, report_reference_number, applicant_name, brand_name, application_number, trademark_class, earlier_trademark, earlier_application_number, document_date, payload_json, report_status, pdf_path, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-
-    const samples: [string, ReportPayload][] = [
-      ['rep-anzora-1', anzora],
-      ['rep-rhino-2', rhino],
-      ['rep-oshaita-3', oshaita],
-    ];
 
     for (const [id, p] of samples) {
       const earlierNames = p.earlierTrademarks.map((m) => m.markName).join(', ');
@@ -299,6 +421,14 @@ function rowToSavedReport(row: Record<string, unknown>): SavedReport {
 export function findUserByEmail(emailOrUsername: string): (AdminUser & { passwordHash: string }) | null {
   const db = getDb();
   const clean = emailOrUsername.trim().toLowerCase();
+  if (!db) {
+    const store = getMemoryStore();
+    return (
+      store.users.find(
+        (u) => u.email.toLowerCase() === clean || (clean === 'admin' && u.id === 'admin-1')
+      ) || null
+    );
+  }
   const row = db
     .prepare(
       'SELECT id, email, name, password_hash, role FROM users WHERE LOWER(email) = ? OR (? = \'admin\' AND id = \'admin-1\')'
@@ -316,6 +446,13 @@ export function findUserByEmail(emailOrUsername: string): (AdminUser & { passwor
 
 export function updateUserPassword(email: string, newPasswordHash: string): boolean {
   const db = getDb();
+  if (!db) {
+    const store = getMemoryStore();
+    const user = store.users.find((u) => u.email.toLowerCase() === email.trim().toLowerCase());
+    if (!user) return false;
+    user.passwordHash = newPasswordHash;
+    return true;
+  }
   const res = db
     .prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE LOWER(email) = LOWER(?)')
     .run(newPasswordHash, new Date().toISOString(), email.trim());
@@ -329,6 +466,30 @@ export function listReports(filters?: {
   date?: string;
 }): SavedReport[] {
   const db = getDb();
+  if (!db) {
+    const store = getMemoryStore();
+    return store.reports
+      .filter((r) => {
+        if (filters?.search && filters.search.trim()) {
+          const q = filters.search.trim().toLowerCase();
+          const hit =
+            (r.applicantName || '').toLowerCase().includes(q) ||
+            (r.brandName || '').toLowerCase().includes(q) ||
+            (r.applicationNumber || '').toLowerCase().includes(q) ||
+            (r.documentId || '').toLowerCase().includes(q);
+          if (!hit) return false;
+        }
+        if (filters?.status && filters.status !== 'All' && r.reportStatus !== filters.status) {
+          return false;
+        }
+        if (filters?.date && filters.date.trim() && r.documentDate !== filters.date.trim()) {
+          return false;
+        }
+        return true;
+      })
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
   const clauses: string[] = [];
   const params: string[] = [];
 
@@ -356,6 +517,9 @@ export function listReports(filters?: {
 
 export function getReportById(id: string): SavedReport | null {
   const db = getDb();
+  if (!db) {
+    return getMemoryStore().reports.find((r) => r.id === id) || null;
+  }
   const row = db.prepare('SELECT * FROM reports WHERE id = ?').get(id) as Record<string, unknown> | undefined;
   return row ? rowToSavedReport(row) : null;
 }
@@ -364,9 +528,23 @@ export function createReport(payload: ReportPayload, pdfPath: string | null = nu
   const db = getDb();
   const id = payload.id || `rep-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   const now = new Date().toISOString();
+  const cleanPayload: ReportPayload = { ...payload, id };
+
+  if (!db) {
+    const created: SavedReport = {
+      ...cleanPayload,
+      id,
+      reportStatus: cleanPayload.reportStatus || 'Draft',
+      pdfPath,
+      createdAt: now,
+      updatedAt: now,
+    };
+    getMemoryStore().reports.unshift(created);
+    return created;
+  }
+
   const earlierNames = payload.earlierTrademarks.map((m) => m.markName).filter(Boolean).join(', ');
   const earlierNos = payload.earlierTrademarks.map((m) => m.applicationNumber).filter(Boolean).join(', ');
-  const cleanPayload: ReportPayload = { ...payload, id };
 
   db.prepare(
     `INSERT INTO reports (id, document_id, report_reference_number, applicant_name, brand_name, application_number, trademark_class, earlier_trademark, earlier_application_number, document_date, payload_json, report_status, pdf_path, created_at, updated_at)
@@ -402,10 +580,24 @@ export function updateReport(
   if (!existing) return null;
 
   const now = new Date().toISOString();
-  const earlierNames = payload.earlierTrademarks.map((m) => m.markName).filter(Boolean).join(', ');
-  const earlierNos = payload.earlierTrademarks.map((m) => m.applicationNumber).filter(Boolean).join(', ');
   const cleanPayload: ReportPayload = { ...payload, id };
   const nextPdfPath = pdfPath !== undefined ? pdfPath : existing.pdfPath;
+
+  if (!db) {
+    const store = getMemoryStore();
+    const updated: SavedReport = {
+      ...cleanPayload,
+      id,
+      pdfPath: nextPdfPath,
+      createdAt: existing.createdAt,
+      updatedAt: now,
+    };
+    store.reports = store.reports.map((r) => (r.id === id ? updated : r));
+    return updated;
+  }
+
+  const earlierNames = payload.earlierTrademarks.map((m) => m.markName).filter(Boolean).join(', ');
+  const earlierNos = payload.earlierTrademarks.map((m) => m.applicationNumber).filter(Boolean).join(', ');
 
   db.prepare(
     `UPDATE reports SET
@@ -445,6 +637,12 @@ export function updateReport(
 
 export function deleteReport(id: string): boolean {
   const db = getDb();
+  if (!db) {
+    const store = getMemoryStore();
+    const prev = store.reports.length;
+    store.reports = store.reports.filter((r) => r.id !== id);
+    return store.reports.length < prev;
+  }
   const res = db.prepare('DELETE FROM reports WHERE id = ?').run(id);
   return res.changes > 0;
 }
@@ -478,7 +676,6 @@ export function getDashboardStats(): DashboardStats {
     (r) => r.reportStatus === 'Generated' || r.reportStatus === 'Finalized'
   ).length;
 
-  // Build 6-month series
   const countsByMonth = new Map<string, number>();
   for (const r of all) {
     const ym = (r.documentDate || r.createdAt).slice(0, 7);
@@ -508,6 +705,11 @@ export function getDashboardStats(): DashboardStats {
 // --- TEMPLATES ---
 export function listTemplates(): ReportTemplate[] {
   const db = getDb();
+  if (!db) {
+    return [...getMemoryStore().templates].sort(
+      (a, b) => Number(b.isDefault) - Number(a.isDefault) || b.updatedAt.localeCompare(a.updatedAt)
+    );
+  }
   const rows = db
     .prepare('SELECT * FROM templates ORDER BY is_default DESC, updated_at DESC')
     .all() as Record<string, unknown>[];
@@ -531,6 +733,25 @@ export function listTemplates(): ReportTemplate[] {
 export function upsertTemplate(tpl: Omit<ReportTemplate, 'createdAt' | 'updatedAt'>): ReportTemplate {
   const db = getDb();
   const now = new Date().toISOString();
+  if (!db) {
+    const store = getMemoryStore();
+    if (tpl.isDefault) {
+      store.templates = store.templates.map((t) => ({ ...t, isDefault: false }));
+    }
+    const existing = store.templates.find((t) => t.id === tpl.id);
+    const saved: ReportTemplate = {
+      ...tpl,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    };
+    if (existing) {
+      store.templates = store.templates.map((t) => (t.id === tpl.id ? saved : t));
+    } else {
+      store.templates.push(saved);
+    }
+    return saved;
+  }
+
   if (tpl.isDefault) {
     db.prepare('UPDATE templates SET is_default = 0').run();
   }
@@ -577,6 +798,12 @@ export function upsertTemplate(tpl: Omit<ReportTemplate, 'createdAt' | 'updatedA
 
 export function deleteTemplate(id: string): boolean {
   const db = getDb();
+  if (!db) {
+    const store = getMemoryStore();
+    const prev = store.templates.length;
+    store.templates = store.templates.filter((t) => t.id !== id);
+    return store.templates.length < prev;
+  }
   const res = db.prepare('DELETE FROM templates WHERE id = ?').run(id);
   return res.changes > 0;
 }
@@ -584,6 +811,11 @@ export function deleteTemplate(id: string): boolean {
 // --- LEGAL CLAUSES ---
 export function listLegalClauses(): LegalClause[] {
   const db = getDb();
+  if (!db) {
+    return [...getMemoryStore().legalClauses].sort(
+      (a, b) => a.category.localeCompare(b.category) || a.title.localeCompare(b.title)
+    );
+  }
   const rows = db.prepare('SELECT * FROM legal_clauses ORDER BY category, title').all() as Record<
     string,
     unknown
@@ -601,6 +833,15 @@ export function listLegalClauses(): LegalClause[] {
 export function upsertLegalClause(clause: Omit<LegalClause, 'updatedAt'>): LegalClause {
   const db = getDb();
   const now = new Date().toISOString();
+  if (!db) {
+    const store = getMemoryStore();
+    const saved: LegalClause = { ...clause, updatedAt: now };
+    const exists = store.legalClauses.some((c) => c.id === clause.id);
+    store.legalClauses = exists
+      ? store.legalClauses.map((c) => (c.id === clause.id ? saved : c))
+      : [...store.legalClauses, saved];
+    return saved;
+  }
   const existing = db.prepare('SELECT id FROM legal_clauses WHERE id = ?').get(clause.id);
   if (existing) {
     db.prepare(
@@ -616,12 +857,21 @@ export function upsertLegalClause(clause: Omit<LegalClause, 'updatedAt'>): Legal
 
 export function deleteLegalClause(id: string): boolean {
   const db = getDb();
+  if (!db) {
+    const store = getMemoryStore();
+    const prev = store.legalClauses.length;
+    store.legalClauses = store.legalClauses.filter((c) => c.id !== id);
+    return store.legalClauses.length < prev;
+  }
   return db.prepare('DELETE FROM legal_clauses WHERE id = ?').run(id).changes > 0;
 }
 
 // --- FEE PRESETS ---
 export function listFeePresets(): FeePreset[] {
   const db = getDb();
+  if (!db) {
+    return [...getMemoryStore().feePresets].sort((a, b) => a.name.localeCompare(b.name));
+  }
   const rows = db.prepare('SELECT * FROM fee_presets ORDER BY name').all() as Record<string, unknown>[];
   return rows.map((r) => ({
     id: String(r.id),
@@ -638,6 +888,15 @@ export function listFeePresets(): FeePreset[] {
 export function upsertFeePreset(preset: Omit<FeePreset, 'updatedAt'>): FeePreset {
   const db = getDb();
   const now = new Date().toISOString();
+  if (!db) {
+    const store = getMemoryStore();
+    const saved: FeePreset = { ...preset, updatedAt: now };
+    const exists = store.feePresets.some((p) => p.id === preset.id);
+    store.feePresets = exists
+      ? store.feePresets.map((p) => (p.id === preset.id ? saved : p))
+      : [...store.feePresets, saved];
+    return saved;
+  }
   const existing = db.prepare('SELECT id FROM fee_presets WHERE id = ?').get(preset.id);
   if (existing) {
     db.prepare(
@@ -671,12 +930,21 @@ export function upsertFeePreset(preset: Omit<FeePreset, 'updatedAt'>): FeePreset
 
 export function deleteFeePreset(id: string): boolean {
   const db = getDb();
+  if (!db) {
+    const store = getMemoryStore();
+    const prev = store.feePresets.length;
+    store.feePresets = store.feePresets.filter((p) => p.id !== id);
+    return store.feePresets.length < prev;
+  }
   return db.prepare('DELETE FROM fee_presets WHERE id = ?').run(id).changes > 0;
 }
 
 // --- SETTINGS ---
 export function getOrganizationSettings(): OrganizationSettings {
   const db = getDb();
+  if (!db) {
+    return { ...getMemoryStore().organizationSettings };
+  }
   const row = db.prepare('SELECT value_json FROM settings WHERE key = ?').get('organization') as
     | { value_json: string }
     | undefined;
@@ -686,6 +954,12 @@ export function getOrganizationSettings(): OrganizationSettings {
 
 export function saveOrganizationSettings(settings: OrganizationSettings): OrganizationSettings {
   const db = getDb();
+  if (!db) {
+    const store = getMemoryStore();
+    store.organizationSettings = { ...DEFAULT_ORGANIZATION_SETTINGS, ...settings };
+    store.reports = store.reports.map((r) => ({ ...r, pdfPath: null }));
+    return { ...store.organizationSettings };
+  }
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)

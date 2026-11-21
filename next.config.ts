@@ -19,6 +19,9 @@ const nextConfig: NextConfig = {
     ],
   },
   output: 'standalone',
+  outputFileTracingIncludes: {
+    '/**': ['./public/fonts/**/*'],
+  },
   transpilePackages: ['motion'],
   serverExternalPackages: ['bcryptjs'],
   webpack: (config, { dev, isServer }) => {

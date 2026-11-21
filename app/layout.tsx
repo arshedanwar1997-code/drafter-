@@ -27,6 +27,10 @@ export const metadata: Metadata = {
   title: 'Legal Success India – Trademark Advisory PDF Generator',
   description:
     'Private trademark examination and Section 11 advisory report generator with live A4 preview, fee management, templates, and fillable PDF export.',
+  icons: {
+    icon: '/images/legal-success-logo.jpg',
+    shortcut: '/images/legal-success-logo.jpg',
+  },
   openGraph: {
     title: 'Legal Success India – Trademark Advisory PDF Generator',
     description:

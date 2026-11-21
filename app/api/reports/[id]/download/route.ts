@@ -1,9 +1,8 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireApiAuth } from '@/lib/auth';
 import { getOrganizationSettings, getReportById, updateReport } from '@/lib/db';
 import { generateAdvisoryPdf } from '@/lib/pdf-generator';
+import { readPdfFromCache, savePdfToCache } from '@/lib/storage';
 import { buildPdfFilename } from '@/lib/text-utils';
 
 export async function GET(
@@ -24,11 +23,11 @@ export async function GET(
   const inline = searchParams.get('inline') === '1';
   const filename = buildPdfFilename(report.brandName, report.applicationNumber, report.documentId);
 
+  const cachedBytes = searchParams.get('mode') === null ? readPdfFromCache(report.pdfPath) : null;
   let pdfBytes: Uint8Array;
-  const storedPath = report.pdfPath ? path.join(process.cwd(), report.pdfPath) : null;
 
-  if (storedPath && fs.existsSync(storedPath) && searchParams.get('mode') === null) {
-    pdfBytes = fs.readFileSync(storedPath);
+  if (cachedBytes) {
+    pdfBytes = cachedBytes;
   } else {
     const orgSettings = getOrganizationSettings();
     const result = await generateAdvisoryPdf(
@@ -37,11 +36,8 @@ export async function GET(
     );
     pdfBytes = result.bytes;
 
-    const dir = path.join(process.cwd(), 'storage', 'generated-pdfs');
-    fs.mkdirSync(dir, { recursive: true });
-    const relPath = path.join('storage', 'generated-pdfs', `${report.documentId}.pdf`);
-    fs.writeFileSync(path.join(process.cwd(), relPath), pdfBytes);
-    updateReport(report.id, report, relPath);
+    const savedPath = savePdfToCache(report.documentId, pdfBytes);
+    updateReport(report.id, report, savedPath);
   }
 
   return new NextResponse(Buffer.from(pdfBytes), {
